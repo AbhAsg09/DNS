@@ -1,0 +1,22 @@
+{
+    "$origin": "purohit.com.",
+    "$ttl": 3600,
+    "soa": {
+        "mname": "ns1.purohit.com.",
+        "rname": "admin.purohit.com.",
+        "serial": "{time}",
+        "refresh": 3600,
+        "retry": 600,
+        "expire": 604800,
+        "minimum": 86400
+    },
+    "ns": [
+        { "host": "ns1.howcode.org." },
+        { "host": "ns2.howcode.org." }
+    ],
+    "a": [
+        { "name": "@", "ttl": 400, "value": "255.255.255.255" },
+        { "name": "@", "ttl": 400, "value": "128.0.2.5" },
+        { "name": "@", "ttl": 400, "value": "8.8.8.8" }
+    ]
+}
