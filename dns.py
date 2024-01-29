@@ -1,4 +1,6 @@
-import socket, glob, json
+import socket
+import json
+import dns, glob
 
 port = 53
 ip = '127.0.0.1'
@@ -6,8 +8,15 @@ ip = '127.0.0.1'
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((ip, port))
 
-def load_zone():
+def resolve_recursive(query_domain):
+    try:
+        # Use socket to perform DNS resolution
+        ip_address = socket.gethostbyname(query_domain)
+        return [{'ttl': 3600, 'value': ip_address}]
+    except socket.gaierror:
+        return []
 
+def load_zone():
     jsonzone = {}
     zonefile = glob.glob('zones/*.zone')
 
@@ -72,9 +81,9 @@ def getquestiondomain(data):
 
 def getzone(domain):
     global zonedata
-
     zone_name = '.'.join(domain)
-    return zonedata[zone_name]
+    return zonedata.get(zone_name, {})
+
 
 def getrecs(data):
     domain, questiontype = getquestiondomain(data)
@@ -84,7 +93,14 @@ def getrecs(data):
         qt = 'a'
 
     zone = getzone(domain)
-    return (zone[qt], qt, domain)
+
+    # Check if the domain is present in the zone files
+    if zone:
+        return (zone.get(qt, []), qt, domain)
+    else:
+        # Perform recursive resolution for external domains
+        records = resolve_recursive('.'.join(domain))
+        return (records, qt, domain)
 
 
 def buildquestion(domainname, rectype):
@@ -125,39 +141,36 @@ def rectobytes(domainname, rectype, recttl, recval):
 
 
 
-def buildresponse(data):
-    # Transaction ID
-    TransactoinID = data[:2]
-
-    # Getting Flags
+def build_response(data):
+    TransactionID = data[:2]
     Flags = getFlags(data[2:4])
-
-    #Question Count
     QDCOUNT = b'\x00\x01'
-
-    #Answer Count
     ANCOUNT = len(getrecs(data[12:])[0]).to_bytes(2, byteorder='big')
-
-    #Nameserver Count
     NSCOUNT = (0).to_bytes(2, byteorder='big')
-
-    #Additional Count
     ARCOUNT = (0).to_bytes(2, byteorder='big')
 
-    dnsheader = TransactoinID+Flags+QDCOUNT+ANCOUNT+NSCOUNT+ARCOUNT
+    dns_header = TransactionID + Flags + QDCOUNT + ANCOUNT + NSCOUNT + ARCOUNT
+    dns_body = b''
 
-    dnsbody = b''
-
-    records, rectype, domainname = getrecs(data[12:])
-
-    dnsquestion = buildquestion(domainname, rectype)
+    records, rectype, domain_name = getrecs(data[12:])
+    dns_question = buildquestion(domain_name, rectype)
 
     for record in records:
-        dnsbody += rectobytes(domainname, rectype, record["ttl"], record["value"])
+        dns_body += rectobytes(domain_name, rectype, record.get("ttl", 0), record.get("value", ''))
 
-    return dnsheader + dnsquestion + dnsbody
+    return dns_header + dns_question + dns_body
+
+
+def get_recs_recursive(data):
+    domain, question_type = getquestiondomain(data)
+    qt = ''
+    if question_type == b'\x00\x01':
+        qt = 'A'
+
+    records = resolve_recursive('.'.join(domain))
+    return records, qt, domain
 
 while True:
     data, addr = sock.recvfrom(512)
-    r = buildresponse(data)
+    r = build_response(data)
     sock.sendto(r, addr)
