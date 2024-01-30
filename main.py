@@ -1,6 +1,11 @@
+import csv
 import socket
 import json
-import dns, glob
+import redis
+import glob
+import time
+from cryptography.fernet import Fernet
+import os
 
 port = 53
 ip = '127.0.0.1'
@@ -8,14 +13,35 @@ ip = '127.0.0.1'
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((ip, port))
 
-def resolve_recursive(query_domain):
-    try:
-        # Use socket to perform DNS resolution
-        ip_address = socket.gethostbyname(query_domain)
-        return [{'ttl': 3600, 'value': ip_address}]
-    except socket.gaierror:
-        return []
+# Redis configuration
+redis_host = 'localhost'
+redis_port = 6379
+redis_db = 0
+redis_password = None
 
+# Connect to the Redis server
+redis_client = redis.StrictRedis(
+    host=redis_host,
+    port=redis_port,
+    db=redis_db,
+    password=redis_password
+)
+
+
+
+# Generating a Fernet key
+encryption_key = Fernet.generate_key()
+
+with open('encryption_key.txt', 'wb') as key_file:
+    key_file.write(encryption_key)
+
+# Load the key from the file
+with open('encryption_key.txt', 'rb') as key_file:
+    encryption_key = key_file.read()
+
+cipher_suite = Fernet(encryption_key)
+
+# Function to load Zonefiles
 def load_zone():
     jsonzone = {}
     zonefile = glob.glob('zones/*.zone')
@@ -29,6 +55,55 @@ def load_zone():
 
 zonedata = load_zone()
 
+# Function to create logs directory if it doesn't exist
+def create_logs_directory():
+    logs_directory = 'logs'
+    if not os.path.exists(logs_directory):
+        os.makedirs(logs_directory)
+
+
+# Function to log DNS queries and responses in CSV format
+def log_dns_query(client_ip, query_domain, response):
+    log_file_path = 'logs/dns_server.log'  # Moved inside the function
+    encrypted_data = cipher_suite.encrypt(response.encode())
+    with open(log_file_path, 'a', newline='') as log_file:
+        csv_writer = csv.writer(log_file)
+        csv_writer.writerow([time.strftime('%Y-%m-%d %H:%M:%S'), client_ip, query_domain, encrypted_data.decode()])
+
+# Function to resolve recursive DNS queries
+def resolve_recursive(query_domain):
+    # Check if the query is already in the Redis cache
+    cached_response = redis_client.get(query_domain)
+
+    if cached_response:
+        cached_response = json.loads(cached_response.decode('utf-8'))
+        timestamp = cached_response['timestamp']
+        ttl = cached_response['ttl']
+
+        # Check if the cached response is still valid
+        if time.time() < timestamp + ttl:
+            return cached_response['records']
+    try:
+        ip_address = socket.gethostbyname(query_domain)
+
+
+        ttl = 3600
+
+        redis_client.setex(query_domain, int(ttl), json.dumps({
+            'records': [{'ttl': ttl, 'value': ip_address}],
+            'timestamp': time.time(),
+            'ttl': ttl
+        }))
+
+        return [{'ttl': ttl, 'value': ip_address}]
+    except socket.gaierror:
+        return []
+
+        return [{'ttl': ttl, 'value': ip_address}]
+    except socket.gaierror:
+        return []
+
+#Creating the flags
 def getFlags(flags):
 
     byte1 = bytes(flags[:1])
@@ -47,7 +122,7 @@ def getFlags(flags):
 
     return int(QR + OPCODE + AA + TC + RD, 2).to_bytes(1, byteorder='big') + int(RA + Z + RCODE, 2).to_bytes(1, byteorder='big')
 
-
+# Getting the domain name from query
 def getquestiondomain(data):
 
     state = 0
@@ -77,7 +152,6 @@ def getquestiondomain(data):
     questiontype = data[y:y+2]
 
     return (domainparts, questiontype)
-    print(questiontype)
 
 def getzone(domain):
     global zonedata
@@ -170,7 +244,22 @@ def get_recs_recursive(data):
     records = resolve_recursive('.'.join(domain))
     return records, qt, domain
 
+# Create logs directory and log file if they don't exist
+create_logs_directory()
+
 while True:
     data, addr = sock.recvfrom(512)
+
+    # Log client IP and query domain
+    client_ip = addr[0]
+    query_domain = getquestiondomain(data)[0][0]
+
+    # Build DNS response
     r = build_response(data)
+
+    # Send DNS response
     sock.sendto(r, addr)
+
+    # Log the query and response
+    records, _, _ = getrecs(data[12:])
+    log_dns_query(client_ip, query_domain, json.dumps(records))
