@@ -6,40 +6,67 @@ import glob
 import time
 from cryptography.fernet import Fernet
 import os
+import logging
+import threading
+import yaml
 
-port = 53
-ip = '127.0.0.1'
+# Function to load configurations from YAML file
+def load_config(filename='config.yaml'):
+    with open(filename, 'r') as config_file:
+        config = yaml.safe_load(config_file)
+    return config
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind((ip, port))
+# Load configurations
+config = load_config()
 
-# Redis configuration
-redis_host = 'localhost'
-redis_port = 6379
-redis_db = 0
-redis_password = None
+# IP and port configurations
+ip = config['dns_server']['ip']
+port = config['dns_server']['port']
+
+try:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((ip, port))
+except socket.error as e:
+    logging.error(f"Socket creation or binding failed: {e}")
+    exit()
+
+
+# Redis configurations
+redis_host = config['redis']['host']
+redis_port = config['redis']['port']
+redis_db = config['redis']['db']
+redis_password = config['redis']['password']
 
 # Connect to the Redis server
-redis_client = redis.StrictRedis(
-    host=redis_host,
-    port=redis_port,
-    db=redis_db,
-    password=redis_password
-)
+try:
+    # Connect to the Redis server
+    redis_client = redis.StrictRedis(
+        host=redis_host,
+        port=redis_port,
+        db=redis_db,
+        password=redis_password
+    )
+except redis.RedisError as e:
+    logging.error(f"Failed to connect to Redis server: {e}")
+    exit()
 
 
 
 # Generating a Fernet key
-encryption_key = Fernet.generate_key()
+try:
+    encryption_key = Fernet.generate_key()
 
-with open('encryption_key.txt', 'wb') as key_file:
-    key_file.write(encryption_key)
+    with open('encryption_key.txt', 'wb') as key_file:
+        key_file.write(encryption_key)
 
-# Load the key from the file
-with open('encryption_key.txt', 'rb') as key_file:
-    encryption_key = key_file.read()
+    # Load the key from the file
+    with open('encryption_key.txt', 'rb') as key_file:
+        encryption_key = key_file.read()
 
-cipher_suite = Fernet(encryption_key)
+    cipher_suite = Fernet(encryption_key)
+except Exception as e:
+    logging.error(f"Encryption key generation or loading failed: {e}")
+    exit()
 
 # Function to load Zonefiles
 def load_zone():
@@ -62,13 +89,25 @@ def create_logs_directory():
         os.makedirs(logs_directory)
 
 
-# Function to log DNS queries and responses in CSV format
-def log_dns_query(client_ip, query_domain, response):
-    log_file_path = 'logs/dns_server.log'  # Moved inside the function
-    encrypted_data = cipher_suite.encrypt(response.encode())
-    with open(log_file_path, 'a', newline='') as log_file:
-        csv_writer = csv.writer(log_file)
-        csv_writer.writerow([time.strftime('%Y-%m-%d %H:%M:%S'), client_ip, query_domain, encrypted_data.decode()])
+# Function to log DNS queries and responses
+def log_dns_query(logger, client_ip, query_domain, response):
+    try:
+        # Combine timestamp, client IP, query domain, and response
+        log_entry = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {client_ip} {query_domain} {response}"
+
+        # Encrypt the combined log entry
+        encrypted_data = cipher_suite.encrypt(log_entry.encode())
+
+        # Log the encrypted data
+        logger.info(f"Client IP: {client_ip}, Query Domain: {query_domain[0]}, Encrypted Response: {encrypted_data.decode()}")
+
+        # Write the encrypted data to the log file
+        log_file_path = config['dns_server'].get('log_file', 'logs/dns_server.log')
+        with open(log_file_path, 'ab') as log_file:
+            log_file.write(encrypted_data + b'\n')
+
+    except Exception as e:
+        logger.error(f"Error while logging DNS query: {e}")
 
 # Function to resolve recursive DNS queries
 def resolve_recursive(query_domain):
@@ -150,7 +189,6 @@ def getquestiondomain(data):
         y += 1
 
     questiontype = data[y:y+2]
-
     return (domainparts, questiontype)
 
 def getzone(domain):
@@ -247,19 +285,34 @@ def get_recs_recursive(data):
 # Create logs directory and log file if they don't exist
 create_logs_directory()
 
+# Main loop with added error handling
+# Function to handle DNS queries
+def handle_dns_query(data, addr):
+    try:
+        # Log client IP and query domain
+        print(addr)
+        client_ip = addr[0]
+
+
+        # Build DNS response
+        r = build_response(data)
+
+        # Send DNS response
+        sock.sendto(r, addr)
+
+        # Log the query and response
+        records, _, domain_name = getrecs(data[12:])
+        query_domain = '.'.join(domain_name[:-1])
+        log_dns_query(logging.getLogger(__name__), client_ip, query_domain, json.dumps(records))
+
+    except socket.error as e:
+        logging.error(f"Socket error while processing request: {e}")
+    except Exception as e:
+        logging.error(f"Unexpected error occurred: {e}")
+
+# Main loop with multithreading
 while True:
     data, addr = sock.recvfrom(512)
 
-    # Log client IP and query domain
-    client_ip = addr[0]
-    query_domain = getquestiondomain(data)[0][0]
-
-    # Build DNS response
-    r = build_response(data)
-
-    # Send DNS response
-    sock.sendto(r, addr)
-
-    # Log the query and response
-    records, _, _ = getrecs(data[12:])
-    log_dns_query(client_ip, query_domain, json.dumps(records))
+    # Create a new thread for each DNS query
+    threading.Thread(target=handle_dns_query, args=(data, addr)).start()
